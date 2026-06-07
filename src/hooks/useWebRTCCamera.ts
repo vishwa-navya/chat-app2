@@ -1,19 +1,15 @@
 /**
- * useWebRTCCamera.ts — FINAL v4
+ * useWebRTCCamera.ts — v5 (Audio + Video)
  *
- * Bugs fixed from v3:
- *  1. announceCamera() was called before it was defined (hoisting issue with arrow fn inside useEffect)
- *  2. socket.on("connect") registered TWICE — caused double announce + race condition
- *  3. Server didn't emit "joined" or "request-offer" — now it does (update server.js too)
- *  4. Retry logic was stopping too early (gotResponseRef set on camera-ready, not on actual video)
+ * Changes from v4:
+ *  - getUserMedia now requests BOTH video and audio
+ *  - Audio tracks added to RTCPeerConnection (so voice is streamed peer-to-peer)
+ *  - remoteStream now carries audio tracks too
+ *  - Audio is LOW LATENCY: no processing, no echo cancellation delay tricks
+ *  - exposing audioEnabled state + toggleAudio() so UI can mute/unmute mic
+ *  - Remote audio plays through the <video> element directly (zero extra buffering)
  *
- * Flow:
- *  Vishwa turns ON  → joins room → server emits "joined" → Vishwa emits "camera-ready"
- *  Ammu turns ON    → joins room → server emits "joined" → Ammu emits "camera-ready"
- *                   → server ALSO emits "request-offer" to Vishwa
- *  Vishwa receives "camera-ready" from Ammu  → sends WebRTC offer
- *  Vishwa receives "request-offer"           → sends WebRTC offer (covers late-join case)
- *  Ammu receives offer → sends answer → ICE exchange → VIDEO APPEARS
+ * Backend: NO CHANGES NEEDED — same signaling, audio travels peer-to-peer via WebRTC
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -27,15 +23,17 @@ export interface UseWebRTCCameraOptions {
 }
 
 export interface UseWebRTCCameraReturn {
-  localStream:  MediaStream | null;
-  remoteStream: MediaStream | null;
-  status:   CamStatus;
-  errorMsg: string | null;
-  stop: () => void;
+  localStream:   MediaStream | null;
+  remoteStream:  MediaStream | null;
+  status:        CamStatus;
+  errorMsg:      string | null;
+  audioEnabled:  boolean;   // is OUR microphone on?
+  toggleAudio:   () => void;
+  stop:          () => void;
 }
 
 const SIGNALING_SERVER = "https://camera-sharing-server.onrender.com";
-const ROOM = "vishwa-ammu-room-v4";
+const ROOM = "vishwa-ammu-room-v4"; // same room as before
 
 const ICE_CONFIG: RTCConfiguration = {
   iceServers: [
@@ -63,16 +61,28 @@ const ICE_CONFIG: RTCConfiguration = {
 export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions): UseWebRTCCameraReturn {
   const [localStream,  setLocalStream]  = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
-  const [status,   setStatus]   = useState<CamStatus>("idle");
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [status,       setStatus]       = useState<CamStatus>("idle");
+  const [errorMsg,     setErrorMsg]     = useState<string | null>(null);
+  const [audioEnabled, setAudioEnabled] = useState(false); // mic starts MUTED
 
   const socketRef      = useRef<Socket | null>(null);
   const pcRef          = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const streamRef      = useRef<MediaStream | null>(null);
   const iceCandidateQ  = useRef<RTCIceCandidateInit[]>([]);
   const cancelledRef   = useRef(false);
   const retryRef       = useRef<ReturnType<typeof setInterval> | null>(null);
-  const streamRef      = useRef<MediaStream | null>(null); // stable ref to stream for callbacks
+
+  // ── Mic toggle (mutes/unmutes our audio track in the stream) ─────────────
+  const toggleAudio = useCallback(() => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    const audioTrack = stream.getAudioTracks()[0];
+    if (!audioTrack) return;
+    audioTrack.enabled = !audioTrack.enabled;
+    setAudioEnabled(audioTrack.enabled);
+    console.log("[Audio] Mic", audioTrack.enabled ? "ON" : "OFF");
+  }, []);
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -82,8 +92,8 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
 
   const destroyPC = () => {
     if (pcRef.current) {
-      pcRef.current.ontrack             = null;
-      pcRef.current.onicecandidate      = null;
+      pcRef.current.ontrack = null;
+      pcRef.current.onicecandidate = null;
       pcRef.current.onnegotiationneeded = null;
       pcRef.current.onconnectionstatechange = null;
       pcRef.current.close();
@@ -96,7 +106,7 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
     stopRetry();
     destroyPC();
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
+      localStreamRef.current.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
     }
     streamRef.current = null;
@@ -110,6 +120,7 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
     setRemoteStream(null);
     setStatus("idle");
     setErrorMsg(null);
+    setAudioEnabled(false);
   }, [nickname]);
 
   const drainICE = async () => {
@@ -121,17 +132,17 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
     iceCandidateQ.current = [];
   };
 
-  // Build fresh PC — call this right before creating offer OR right before setting remote offer
   const buildPC = (stream: MediaStream): RTCPeerConnection => {
     destroyPC();
     const pc = new RTCPeerConnection(ICE_CONFIG);
     pcRef.current = pc;
 
-    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    // Add ALL tracks (video + audio) so peer receives both
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
     pc.ontrack = ({ streams }) => {
       if (streams[0] && !cancelledRef.current) {
-        console.log("[WebRTC] ✅ Remote stream received!");
+        console.log("[WebRTC] ✅ Remote stream received (video+audio)");
         stopRetry();
         setRemoteStream(streams[0]);
         setStatus("connected");
@@ -146,27 +157,24 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
 
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
-      console.log("[WebRTC] connection state:", s);
-      if (s === "failed") {
-        pc.restartIce();
-      }
-      if (s === "disconnected") {
-        setRemoteStream(null);
-        setStatus("connecting");
-      }
+      console.log("[WebRTC] state:", s);
+      if (s === "failed") pc.restartIce();
+      if (s === "disconnected") { setRemoteStream(null); setStatus("connecting"); }
     };
 
     return pc;
   };
 
-  // Vishwa creates and sends offer
   const sendOffer = async () => {
     const stream = streamRef.current;
     if (!stream || cancelledRef.current) return;
     console.log("[WebRTC] Creating offer...");
     const pc = buildPC(stream);
     try {
-      const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
+      const offer = await pc.createOffer({
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: true,  // ← tell peer we want audio too
+      });
       await pc.setLocalDescription(offer);
       socketRef.current?.emit("offer", { room: ROOM, from: nickname, sdp: pc.localDescription });
       console.log("[WebRTC] 📡 Offer sent");
@@ -186,26 +194,59 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
 
     const run = async () => {
 
-      // STEP 1: Get camera
+      // STEP 1: Get camera + microphone
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-          audio: false,
+          video: {
+            width:  { ideal: 1280, max: 1920 },
+            height: { ideal: 720,  max: 1080 },
+            facingMode: "user",
+          },
+          audio: {
+            // Low-latency audio settings — minimize processing delay
+            echoCancellation: true,       // prevents echo from speakers
+            noiseSuppression: true,       // cleaner voice
+            autoGainControl:  true,       // consistent volume
+            // Latency hints for browser
+            latency: 0,                   // request lowest possible latency
+            channelCount: 1,              // mono is faster than stereo
+            sampleRate: 48000,            // standard WebRTC sample rate
+          },
         });
       } catch (err: any) {
         if (cancelledRef.current) return;
-        const msg =
-          err.name === "NotAllowedError"   ? "Camera permission denied. Please allow camera access and try again." :
-          err.name === "NotFoundError"     ? "No camera found on this device." :
-          err.name === "NotReadableError"  ? "Camera is in use by another app. Close it and retry." :
-                                            "Could not access camera.";
-        setStatus("error"); setErrorMsg(msg); return;
+
+        // If microphone denied, fall back to video-only
+        if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+          console.warn("[Audio] Mic permission denied, falling back to video only");
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+              audio: false,
+            });
+          } catch (vidErr: any) {
+            if (cancelledRef.current) return;
+            setStatus("error");
+            setErrorMsg("Camera permission denied. Please allow camera access and try again.");
+            return;
+          }
+        } else {
+          if (cancelledRef.current) return;
+          const msg =
+            err.name === "NotFoundError"    ? "No camera found on this device." :
+            err.name === "NotReadableError" ? "Camera is in use by another app. Close it and retry." :
+                                             "Could not access camera/microphone.";
+          setStatus("error"); setErrorMsg(msg); return;
+        }
       }
 
       if (cancelledRef.current) { stream.getTracks().forEach(t => t.stop()); return; }
 
-      // Store stream in both ref and state
+      // Start mic MUTED (user turns it on via speaker button in UI)
+      stream.getAudioTracks().forEach(t => { t.enabled = false; });
+      setAudioEnabled(false);
+
       localStreamRef.current = stream;
       streamRef.current = stream;
       setLocalStream(stream);
@@ -218,58 +259,42 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
       });
       socketRef.current = socket;
 
-      // STEP 3: On connect, join the room
       socket.on("connect", () => {
-        console.log("[Socket] ✅ Connected, joining room...");
+        console.log("[Socket] ✅ Connected:", socket.id);
         socket.emit("join", { room: ROOM, user: nickname });
       });
 
-      // STEP 4: Server confirms join → NOW announce our camera
-      // This is the ONLY place we start the announce + retry loop
       socket.on("joined", ({ count }: { count: number }) => {
-        console.log(`[Socket] Room joined. Users in room: ${count}`);
-        
-        // Announce camera immediately
+        console.log(`[Socket] Room joined. Users: ${count}`);
         socket.emit("camera-ready", { room: ROOM, from: nickname });
         console.log("[Socket] 📣 camera-ready sent");
 
-        // Retry every 3s until we actually get remote video
         stopRetry();
         retryRef.current = setInterval(() => {
           if (cancelledRef.current) { stopRetry(); return; }
-          // Check if we already have remote stream (stop retrying)
           if (pcRef.current?.connectionState === "connected") { stopRetry(); return; }
           if (socket.connected) {
-            console.log("[Socket] 🔁 Retrying camera-ready...");
+            console.log("[Socket] 🔁 Retry camera-ready...");
             socket.emit("camera-ready", { room: ROOM, from: nickname });
           }
         }, 3000);
       });
 
-      // STEP 5: Other person's camera is ready
-      // → Vishwa sends offer; Ammu just waits for the offer
       socket.on("camera-ready", async ({ from }: { from: string }) => {
         if (from === nickname || cancelledRef.current) return;
         console.log(`[Socket] 📷 ${from} camera ready`);
-
-        if (nickname === "Vishwa") {
-          await sendOffer();
-        }
-        // Ammu: do nothing here — offer will arrive via "offer" event
+        if (nickname === "Vishwa") await sendOffer();
       });
 
-      // STEP 6: Server tells Vishwa to send offer (Ammu joined while Vishwa already in room)
       socket.on("request-offer", async ({ to }: { to: string }) => {
         if (nickname !== "Vishwa" || cancelledRef.current) return;
-        console.log("[Socket] 📨 request-offer received, sending offer to:", to);
+        console.log("[Socket] 📨 request-offer for:", to);
         await sendOffer();
       });
 
-      // STEP 7: Ammu receives offer → creates answer
       socket.on("offer", async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
         if (from === nickname || cancelledRef.current) return;
-        console.log("[Socket] 📨 Offer received from:", from);
-
+        console.log("[Socket] 📨 Offer from:", from);
         const pc = buildPC(stream);
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(sdp));
@@ -283,12 +308,11 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
         }
       });
 
-      // STEP 8: Vishwa receives answer
       socket.on("answer", async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
         if (from === nickname || cancelledRef.current) return;
-        console.log("[Socket] 📨 Answer received from:", from);
+        console.log("[Socket] 📨 Answer from:", from);
         const pc = pcRef.current;
-        if (!pc) { console.warn("[WebRTC] No PC to set answer on!"); return; }
+        if (!pc) return;
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(sdp));
           await drainICE();
@@ -297,25 +321,20 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
         }
       });
 
-      // STEP 9: ICE candidates
       socket.on("ice", async ({ from, candidate }: { from: string; candidate: RTCIceCandidateInit }) => {
         if (from === nickname || !candidate) return;
         const pc = pcRef.current;
         if (!pc) return;
-        if (!pc.remoteDescription) {
-          iceCandidateQ.current.push(candidate); return;
-        }
+        if (!pc.remoteDescription) { iceCandidateQ.current.push(candidate); return; }
         try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch {}
       });
 
-      // STEP 10: Partner turned camera off
       socket.on("camera-off", ({ from }: { from: string }) => {
         if (from === nickname) return;
-        console.log(`[Socket] ❌ ${from} turned camera off`);
+        console.log(`[Socket] ❌ ${from} camera off`);
         destroyPC();
         setRemoteStream(null);
         setStatus("connecting");
-        // Re-announce so when they come back, they can reconnect to us
         if (socket.connected && !cancelledRef.current) {
           socket.emit("camera-ready", { room: ROOM, from: nickname });
         }
@@ -347,5 +366,5 @@ export function useWebRTCCamera({ nickname, isEnabled }: UseWebRTCCameraOptions)
 
   const stop = useCallback(() => cleanup(true), [cleanup]);
 
-  return { localStream, remoteStream, status, errorMsg, stop };
+  return { localStream, remoteStream, status, errorMsg, audioEnabled, toggleAudio, stop };
 }

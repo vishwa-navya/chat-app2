@@ -1,26 +1,33 @@
 /**
- * CameraShareOverlay.tsx — DRAGGABLE v5
+ * CameraShareOverlay.tsx — v6 (Audio/Speaker button added)
  *
- * - Fully draggable on both mouse (laptop) and touch (phone)
- * - Default position: right side, vertically centered (desktop) / bottom-center (mobile)
- * - User can drag it anywhere on screen
- * - Stays within screen bounds (won't go off-screen)
- * - Fullscreen, Minimize, Close buttons still work
- * - Position resets when going fullscreen → back to floating
+ * New in v6:
+ *  - Speaker (🔊) button in the control bar — OFF by default
+ *  - When speaker OFF: remote video is muted (you hear nothing)
+ *  - When speaker ON:  remote video plays audio (you hear the other person)
+ *  - Mic button (🎤) also in controls — toggles YOUR microphone
+ *  - Both default to OFF for privacy
+ *  - Draggable on mouse + touch (same as v5)
+ *  - Remote <video> element uses autoPlay + playsInline for zero-buffer playback
  */
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
-import { Maximize2, Minimize2, X, Video, VideoOff, Loader2, WifiOff } from "lucide-react";
+import {
+  Maximize2, Minimize2, X, Video, VideoOff,
+  Loader2, WifiOff, Volume2, VolumeX, Mic, MicOff,
+} from "lucide-react";
 import type { CamStatus } from "../hooks/useWebRTCCamera";
 
 interface CameraShareOverlayProps {
   localStream:  MediaStream | null;
   remoteStream: MediaStream | null;
-  status:   CamStatus;
-  errorMsg: string | null;
-  nickname: "Vishwa" | "Ammu";
-  isEnabled: boolean;
-  onClose: () => void;
+  status:       CamStatus;
+  errorMsg:     string | null;
+  nickname:     "Vishwa" | "Ammu";
+  isEnabled:    boolean;
+  audioEnabled: boolean;       // is OUR mic on?
+  onToggleAudio: () => void;   // toggle our mic
+  onClose:       () => void;
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
@@ -50,16 +57,30 @@ function Vid({ stream, muted = false, style, label }: {
   style?: React.CSSProperties; label?: string;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
+
   useEffect(() => {
     const el = ref.current; if (!el) return;
-    if (stream) { el.srcObject = stream; el.play().catch(() => {}); }
-    else el.srcObject = null;
+    if (stream) {
+      el.srcObject = stream;
+      // Low-latency playback: no buffering tricks, just play directly
+      el.play().catch(() => {});
+    } else {
+      el.srcObject = null;
+    }
   }, [stream]);
+
+  // When muted prop changes, update the element directly
+  useEffect(() => {
+    const el = ref.current;
+    if (el) el.muted = muted;
+  }, [muted]);
 
   return (
     <div style={{ position: "relative", ...style }}>
-      <video ref={ref} autoPlay playsInline muted={muted}
-        style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+      <video
+        ref={ref} autoPlay playsInline muted={muted}
+        style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+      />
       {label && (
         <span style={{
           position: "absolute", bottom: 4, left: 6, fontSize: 10,
@@ -102,18 +123,25 @@ function NoRemote({ status, errorMsg, other }: { status: CamStatus; errorMsg: st
 
 // ─── Control button ───────────────────────────────────────────────────────────
 
-function Btn({ children, onClick, title, danger = false }: {
-  children: React.ReactNode; onClick: () => void; title?: string; danger?: boolean;
+function Btn({ children, onClick, title, danger = false, active = false }: {
+  children: React.ReactNode; onClick: () => void;
+  title?: string; danger?: boolean; active?: boolean;
 }) {
+  const bg = danger
+    ? "rgba(239,68,68,0.85)"
+    : active
+    ? "rgba(34,197,94,0.85)"    // green when active
+    : "rgba(255,255,255,0.22)"; // dim when inactive
+
   return (
     <button onClick={onClick} title={title} style={{
-      width: 24, height: 24, borderRadius: "50%", border: "none", cursor: "pointer",
-      background: danger ? "rgba(239,68,68,0.85)" : "rgba(255,255,255,0.25)",
-      color: "#fff", display: "flex", alignItems: "center", justifyContent: "center",
-      flexShrink: 0, transition: "background .15s",
+      width: 26, height: 26, borderRadius: "50%", border: "none", cursor: "pointer",
+      background: bg, color: "#fff",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      flexShrink: 0, transition: "background .15s, transform .1s",
     }}
-    onMouseEnter={e => (e.currentTarget.style.background = danger ? "#dc2626" : "rgba(255,255,255,0.45)")}
-    onMouseLeave={e => (e.currentTarget.style.background = danger ? "rgba(239,68,68,0.85)" : "rgba(255,255,255,0.25)")}
+    onMouseEnter={e => { e.currentTarget.style.transform = "scale(1.15)"; }}
+    onMouseLeave={e => { e.currentTarget.style.transform = "scale(1)"; }}
     >
       {children}
     </button>
@@ -123,65 +151,54 @@ function Btn({ children, onClick, title, danger = false }: {
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export default function CameraShareOverlay({
-  localStream, remoteStream, status, errorMsg, nickname, isEnabled, onClose,
+  localStream, remoteStream, status, errorMsg,
+  nickname, isEnabled,
+  audioEnabled, onToggleAudio,
+  onClose,
 }: CameraShareOverlayProps) {
+
+  // Speaker = can you HEAR the other person (remote audio unmuted)
+  // Default: OFF (remote video is muted)
+  const [speakerOn, setSpeakerOn] = useState(false);
 
   const [fullscreen, setFullscreen] = useState(false);
   const [minimized,  setMinimized]  = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
-  // ── Drag state ──────────────────────────────────────────────────────────────
-  const boxRef       = useRef<HTMLDivElement>(null);
-  const isDragging   = useRef(false);
-  const dragStart    = useRef({ x: 0, y: 0 });   // pointer position at drag start
-  const boxStart     = useRef({ x: 0, y: 0 });   // box position at drag start
-  const [pos, setPos] = useState<{ x: number; y: number } | null>(null); // null = use default CSS
+  const other = nickname === "Vishwa" ? "Ammu" : "Vishwa";
 
-  // ── Default position (computed once on first render) ────────────────────────
+  // ── Drag ───────────────────────────────────────────────────────────────────
+  const boxRef     = useRef<HTMLDivElement>(null);
+  const isDragging = useRef(false);
+  const dragStart  = useRef({ x: 0, y: 0 });
+  const boxStart   = useRef({ x: 0, y: 0 });
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+
   const getDefaultPos = useCallback(() => {
     const isMobile = window.innerWidth < 768;
-    const W = 240;
-    const H = Math.round(W * 3 / 4); // 4:3 ratio = 180px
-    if (isMobile) {
-      // Bottom center, above input bar
-      return {
-        x: Math.round((window.innerWidth - W) / 2),
-        y: window.innerHeight - H - 140,
-      };
-    } else {
-      // Right side, vertically centered
-      return {
-        x: window.innerWidth - W - 20,
-        y: Math.round((window.innerHeight - H) / 2),
-      };
-    }
+    const W = isMobile ? 240 : 280;
+    const H = Math.round(W * 3 / 4);
+    return isMobile
+      ? { x: Math.round((window.innerWidth - W) / 2), y: window.innerHeight - H - 140 }
+      : { x: window.innerWidth - W - 20,              y: Math.round((window.innerHeight - H) / 2) };
   }, []);
 
-  // Set default position on mount / when overlay becomes visible
   useEffect(() => {
-    if (isEnabled && !fullscreen && !minimized) {
-      setPos(p => p ?? getDefaultPos());
-    }
+    if (isEnabled && !fullscreen && !minimized) setPos(p => p ?? getDefaultPos());
   }, [isEnabled, fullscreen, minimized, getDefaultPos]);
 
-  // Reset position when coming back from fullscreen
-  useEffect(() => {
-    if (!fullscreen) setPos(getDefaultPos());
-  }, [fullscreen, getDefaultPos]);
+  useEffect(() => { if (!fullscreen) setPos(getDefaultPos()); }, [fullscreen, getDefaultPos]);
 
-  // ── Clamp box within viewport ───────────────────────────────────────────────
   const clamp = useCallback((x: number, y: number) => {
-    const W = boxRef.current?.offsetWidth  ?? 240;
-    const H = boxRef.current?.offsetHeight ?? 180;
+    const W = boxRef.current?.offsetWidth  ?? 280;
+    const H = boxRef.current?.offsetHeight ?? 210;
     return {
       x: Math.max(0, Math.min(x, window.innerWidth  - W)),
       y: Math.max(0, Math.min(y, window.innerHeight - H)),
     };
   }, []);
 
-  // ── Mouse drag ──────────────────────────────────────────────────────────────
   const onMouseDown = useCallback((e: React.MouseEvent) => {
-    // Don't drag when clicking buttons
     if ((e.target as HTMLElement).closest("button")) return;
     e.preventDefault();
     isDragging.current = true;
@@ -192,20 +209,15 @@ export default function CameraShareOverlay({
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!isDragging.current) return;
-      const dx = e.clientX - dragStart.current.x;
-      const dy = e.clientY - dragStart.current.y;
-      setPos(clamp(boxStart.current.x + dx, boxStart.current.y + dy));
+      setPos(clamp(boxStart.current.x + e.clientX - dragStart.current.x,
+                   boxStart.current.y + e.clientY - dragStart.current.y));
     };
     const onUp = () => { isDragging.current = false; };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup",   onUp);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup",   onUp);
-    };
+    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
   }, [clamp]);
 
-  // ── Touch drag ─────────────────────────────────────────────────────────────
   const onTouchStart = useCallback((e: React.TouchEvent) => {
     if ((e.target as HTMLElement).closest("button")) return;
     const t = e.touches[0];
@@ -217,23 +229,18 @@ export default function CameraShareOverlay({
   useEffect(() => {
     const onMove = (e: TouchEvent) => {
       if (!isDragging.current) return;
-      e.preventDefault(); // prevent page scroll while dragging
+      e.preventDefault();
       const t = e.touches[0];
-      const dx = t.clientX - dragStart.current.x;
-      const dy = t.clientY - dragStart.current.y;
-      setPos(clamp(boxStart.current.x + dx, boxStart.current.y + dy));
+      setPos(clamp(boxStart.current.x + t.clientX - dragStart.current.x,
+                   boxStart.current.y + t.clientY - dragStart.current.y));
     };
     const onEnd = () => { isDragging.current = false; };
     window.addEventListener("touchmove", onMove, { passive: false });
     window.addEventListener("touchend",  onEnd);
-    return () => {
-      window.removeEventListener("touchmove", onMove);
-      window.removeEventListener("touchend",  onEnd);
-    };
+    return () => { window.removeEventListener("touchmove", onMove); window.removeEventListener("touchend", onEnd); };
   }, [clamp]);
 
-  // ── Toast logic ─────────────────────────────────────────────────────────────
-  const other = nickname === "Vishwa" ? "Ammu" : "Vishwa";
+  // ── Toast ──────────────────────────────────────────────────────────────────
   const prevRemote  = useRef<MediaStream | null>(null);
   const prevEnabled = useRef(false);
 
@@ -243,15 +250,12 @@ export default function CameraShareOverlay({
   }, [isEnabled, nickname]);
 
   useEffect(() => {
-    if (remoteStream && !prevRemote.current)  setToast(`${other} started camera sharing`);
-    if (!remoteStream && prevRemote.current)  setToast(`${other} stopped camera sharing`);
+    if (remoteStream  && !prevRemote.current) setToast(`${other} started camera sharing`);
+    if (!remoteStream &&  prevRemote.current) setToast(`${other} stopped camera sharing`);
     prevRemote.current = remoteStream;
   }, [remoteStream, other]);
 
-  const handleClose = () => {
-    setToast(`${nickname} stopped camera sharing`);
-    setTimeout(onClose, 300);
-  };
+  const handleClose = () => { setToast(`${nickname} stopped camera sharing`); setTimeout(onClose, 300); };
 
   if (!isEnabled && !localStream && !remoteStream) return null;
 
@@ -260,44 +264,96 @@ export default function CameraShareOverlay({
     status === "connecting"               ? "#facc15" :
     status === "error"                    ? "#ef4444" : "#9ca3af";
 
-  // ── Fullscreen ──────────────────────────────────────────────────────────────
+  // ── Shared control bar ─────────────────────────────────────────────────────
+  const ControlBar = ({ inFullscreen = false }: { inFullscreen?: boolean }) => (
+    <div style={{
+      position: "absolute", top: 0, left: 0, right: 0, zIndex: 10,
+      display: "flex", alignItems: "center", justifyContent: "space-between",
+      padding: inFullscreen ? "12px 14px" : "7px 8px",
+      background: "linear-gradient(to bottom,rgba(0,0,0,0.7),transparent)",
+    }}>
+      {/* Status dot */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{
+          width: 8, height: 8, borderRadius: "50%", background: dotColor, display: "inline-block",
+          boxShadow: status === "connected" && remoteStream ? "0 0 6px #22c55e" : "none",
+        }} />
+        <span style={{ color: "rgba(255,255,255,0.8)", fontSize: inFullscreen ? 13 : 11, fontWeight: 600 }}>
+          {status === "connected" && remoteStream ? "Live"
+            : status === "connecting" ? "Connecting…"
+            : status === "error"      ? "Error"
+            : "Camera On"}
+        </span>
+      </div>
+
+      {/* Buttons */}
+      <div style={{ display: "flex", gap: inFullscreen ? 8 : 4, alignItems: "center" }}>
+
+        {/* 🎤 Mic button — toggles YOUR microphone */}
+        <Btn
+          title={audioEnabled ? "Mute microphone" : "Unmute microphone"}
+          onClick={onToggleAudio}
+          active={audioEnabled}
+        >
+          {audioEnabled ? <Mic size={12} /> : <MicOff size={12} />}
+        </Btn>
+
+        {/* 🔊 Speaker button — toggles hearing the other person */}
+        <Btn
+          title={speakerOn ? "Mute speaker" : "Turn on speaker to hear other person"}
+          onClick={() => setSpeakerOn(s => !s)}
+          active={speakerOn}
+        >
+          {speakerOn ? <Volume2 size={12} /> : <VolumeX size={12} />}
+        </Btn>
+
+        {/* Fullscreen / exit fullscreen */}
+        {!inFullscreen ? (
+          <Btn title="Fullscreen" onClick={() => { setFullscreen(true); setMinimized(false); }}>
+            <Maximize2 size={12} />
+          </Btn>
+        ) : (
+          <Btn title="Exit fullscreen" onClick={() => setFullscreen(false)}>
+            <Minimize2 size={12} />
+          </Btn>
+        )}
+
+        {/* Minimize (only in floating mode) */}
+        {!inFullscreen && (
+          <Btn title="Minimize" onClick={() => { setMinimized(true); setFullscreen(false); }}>
+            <Minimize2 size={12} />
+          </Btn>
+        )}
+
+        {/* Close */}
+        <Btn title="Stop camera sharing" onClick={handleClose} danger>
+          <X size={12} />
+        </Btn>
+      </div>
+    </div>
+  );
+
+  // ── Fullscreen ─────────────────────────────────────────────────────────────
   if (fullscreen) {
     return (
       <>
         {toast && <Toast msg={toast} onDone={() => setToast(null)} />}
         <div style={{ position: "fixed", inset: 0, zIndex: 500, background: "#000", display: "flex", flexDirection: "column" }}>
-          {/* Controls */}
-          <div style={{
-            position: "absolute", top: 0, left: 0, right: 0, zIndex: 2,
-            display: "flex", alignItems: "center", justifyContent: "space-between",
-            padding: "10px 12px",
-            background: "linear-gradient(to bottom,rgba(0,0,0,0.65),transparent)",
-          }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ width: 9, height: 9, borderRadius: "50%", background: dotColor, display: "inline-block" }} />
-              <span style={{ color: "rgba(255,255,255,0.8)", fontSize: 12, fontWeight: 600 }}>
-                {remoteStream ? "Live" : "Connecting…"}
-              </span>
-            </div>
-            <div style={{ display: "flex", gap: 6 }}>
-              <Btn title="Exit fullscreen" onClick={() => setFullscreen(false)}><Minimize2 size={13} /></Btn>
-              <Btn title="Stop sharing" onClick={handleClose} danger><X size={13} /></Btn>
-            </div>
-          </div>
-          {/* Remote video */}
+          <ControlBar inFullscreen />
           <div style={{ flex: 1, position: "relative" }}>
             {remoteStream
-              ? <Vid stream={remoteStream} style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} label={other} />
+              ? <Vid stream={remoteStream} muted={!speakerOn}
+                     style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+                     label={other} />
               : <NoRemote status={status} errorMsg={errorMsg} other={other} />}
           </div>
-          {/* PiP */}
           {localStream && (
             <div style={{
               position: "absolute", bottom: 20, right: 20,
-              width: 120, height: 90, borderRadius: 10, overflow: "hidden",
+              width: 130, height: 98, borderRadius: 10, overflow: "hidden",
               border: "2px solid rgba(255,255,255,0.35)", boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
             }}>
-              <Vid stream={localStream} muted style={{ width: 120, height: 90 }} label="You" />
+              <Vid stream={localStream} muted style={{ width: 130, height: 98 }} label="You" />
             </div>
           )}
         </div>
@@ -305,7 +361,7 @@ export default function CameraShareOverlay({
     );
   }
 
-  // ── Minimized pill ──────────────────────────────────────────────────────────
+  // ── Minimized pill ─────────────────────────────────────────────────────────
   if (minimized) {
     return (
       <>
@@ -315,31 +371,28 @@ export default function CameraShareOverlay({
           title="Expand camera"
           style={{
             position: "fixed",
-            bottom: pos ? undefined : 110,
-            top:    pos ? pos.y : undefined,
-            left:   pos ? pos.x : undefined,
-            right:  pos ? undefined : 20,
+            top: pos?.y ?? undefined, left: pos?.x ?? undefined,
+            bottom: pos ? undefined : 110, right: pos ? undefined : 20,
             zIndex: 500,
             background: "linear-gradient(135deg,#10b981,#059669)",
             borderRadius: 999, padding: "8px 14px",
             display: "flex", alignItems: "center", gap: 8,
-            cursor: "grab", boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
-            userSelect: "none",
+            cursor: "pointer", boxShadow: "0 4px 16px rgba(0,0,0,0.25)", userSelect: "none",
           }}
         >
           <div style={{ width: 28, height: 28, borderRadius: "50%", overflow: "hidden", border: "2px solid rgba(255,255,255,0.5)" }}>
             {localStream ? <Vid stream={localStream} muted style={{ width: 28, height: 28 }} /> : <Video size={14} color="#fff" />}
           </div>
           <span style={{ color: "#fff", fontSize: 12, fontWeight: 600 }}>Camera</span>
-          {remoteStream && <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#fff", display: "inline-block", animation: "pulse 1s infinite" }} />}
-          <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
+          {remoteStream && <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#fff", display: "inline-block" }} />}
         </div>
       </>
     );
   }
 
-  // ── Floating draggable window ───────────────────────────────────────────────
+  // ── Floating draggable window ──────────────────────────────────────────────
   const W = window.innerWidth < 768 ? 240 : 280;
+  const defaultPos = getDefaultPos();
 
   return (
     <>
@@ -351,13 +404,13 @@ export default function CameraShareOverlay({
         onTouchStart={onTouchStart}
         style={{
           position: "fixed",
-          left: pos?.x ?? (window.innerWidth - W - 20),
-          top:  pos?.y ?? Math.round((window.innerHeight - Math.round(W * 3/4)) / 2),
+          left: pos?.x ?? defaultPos.x,
+          top:  pos?.y ?? defaultPos.y,
           width: W,
           zIndex: 500,
-          cursor: isDragging.current ? "grabbing" : "grab",
+          cursor: "grab",
           userSelect: "none",
-          touchAction: "none",   // critical for mobile drag
+          touchAction: "none",
         }}
       >
         <div style={{
@@ -368,53 +421,16 @@ export default function CameraShareOverlay({
           aspectRatio: "4/3",
           position: "relative",
         }}>
-          {/* Top bar */}
-          <div style={{
-            position: "absolute", top: 0, left: 0, right: 0, zIndex: 3,
-            display: "flex", alignItems: "center", justifyContent: "space-between",
-            padding: "7px 8px",
-            background: "linear-gradient(to bottom,rgba(0,0,0,0.65),transparent)",
-          }}>
-            {/* Status */}
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{
-                width: 8, height: 8, borderRadius: "50%", background: dotColor, display: "inline-block",
-                boxShadow: status === "connected" && remoteStream ? "0 0 6px #22c55e" : "none",
-                animation: status === "connecting" ? "pulse 1s infinite" : "none",
-              }} />
-              <span style={{ color: "rgba(255,255,255,0.8)", fontSize: 11, fontWeight: 600 }}>
-                {status === "connected" && remoteStream ? "Live"
-                  : status === "connecting" ? "Connecting…"
-                  : status === "error"      ? "Error"
-                  : "Camera On"}
-              </span>
-            </div>
+          <ControlBar />
 
-            {/* Drag hint */}
-            <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, flex: 1, textAlign: "center" }}>
-              ⠿ drag
-            </span>
-
-            {/* Buttons */}
-            <div style={{ display: "flex", gap: 4 }}>
-              <Btn title="Fullscreen" onClick={() => { setFullscreen(true); setMinimized(false); }}>
-                <Maximize2 size={12} />
-              </Btn>
-              <Btn title="Minimize" onClick={() => { setMinimized(true); setFullscreen(false); }}>
-                <Minimize2 size={12} />
-              </Btn>
-              <Btn title="Stop camera sharing" onClick={handleClose} danger>
-                <X size={12} />
-              </Btn>
-            </div>
-          </div>
-
-          {/* Remote stream (main view) */}
+          {/* Remote stream — muted when speaker is OFF */}
           {remoteStream
-            ? <Vid stream={remoteStream} style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} label={other} />
+            ? <Vid stream={remoteStream} muted={!speakerOn}
+                   style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+                   label={other} />
             : <NoRemote status={status} errorMsg={errorMsg} other={other} />}
 
-          {/* PiP: your own camera */}
+          {/* PiP: own camera — always muted (we don't want to hear ourselves) */}
           {localStream && (
             <div style={{
               position: "absolute", bottom: 8, right: 8,
@@ -423,6 +439,18 @@ export default function CameraShareOverlay({
               boxShadow: "0 2px 8px rgba(0,0,0,0.4)", zIndex: 4,
             }}>
               <Vid stream={localStream} muted style={{ width: 64, height: 48 }} label="You" />
+            </div>
+          )}
+
+          {/* Audio status badge — shows when speaker is off so user knows why they hear nothing */}
+          {remoteStream && !speakerOn && (
+            <div style={{
+              position: "absolute", bottom: 8, left: 8, zIndex: 5,
+              background: "rgba(0,0,0,0.6)", borderRadius: 99,
+              padding: "3px 8px", display: "flex", alignItems: "center", gap: 4,
+            }}>
+              <VolumeX size={10} color="#fbbf24" />
+              <span style={{ color: "#fbbf24", fontSize: 10, fontWeight: 600 }}>Speaker off</span>
             </div>
           )}
         </div>

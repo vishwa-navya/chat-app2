@@ -108,6 +108,8 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
     remoteStream,
     status: camSharingStatus,
     errorMsg: camSharingError,
+    audioEnabled: camAudioEnabled,
+    toggleAudio: camToggleAudio,
     stop: stopCameraSharing,
   } = useWebRTCCamera({ nickname, isEnabled: isCameraSharing });
 
@@ -837,6 +839,8 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
         errorMsg={camSharingError}
         nickname={nickname}
         isEnabled={isCameraSharing}
+        audioEnabled={camAudioEnabled}
+        onToggleAudio={camToggleAudio}
         onClose={handleCameraShareClose}
       />
 

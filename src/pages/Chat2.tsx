@@ -40,8 +40,14 @@ import VoiceMessageInline from '../components/VoiceMessageInline';
 import CoupleMemoryPage from '../components/ui/CoupleMemoryPage';
 import { createDownscaledPreview, createPreviewUrl, detectDeviceCapabilities } from '../lib/imageCompression';
 
+// ── NEW: Camera sharing imports ────────────────────────────────────────────────
+import { useWebRTCCamera } from '../hooks/useWebRTCCamera';
+import CameraShareOverlay from '../components/CameraShareOverlay';
+import { useVoiceCall } from '../hooks/useVoiceCall';
+import BookIconMenu from '../components/BookIconMenu';
+// ──────────────────────────────────────────────────────────────────────────────
 
-const BACKEND_URL = "https://notification-production-bdd8.up.railway.app"; //// vishwanavyasree account 12/5/26
+const BACKEND_URL = "https://notification2.onrender.com"; //// vishwanavyasree account 12/5/26
 
 
 interface Chat2Props {
@@ -52,15 +58,6 @@ interface Chat2Props {
   onOpenCoupleMemory?: () => void;
 }
 
-/**
- * MEMORY-OPTIMIZED CHAT COMPONENT
- * 
- * Key Changes:
- * 1. Uses blob URLs instead of base64 for image previews (33% less memory)
- * 2. Properly cleans up blob URLs when no longer needed
- * 3. Processes camera images before showing preview
- * 4. Uses refs to track preview URLs for cleanup
- */
 function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCoupleMemory }: Chat2Props) {
   const handleAIClick = () => {
     onSwitchToAIChat();
@@ -92,6 +89,61 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
   const [showMoodPicker, setShowMoodPicker] = useState(false);
   const [replyToMood, setReplyToMood] = useState<{ emoji: string; partnerNickname: string } | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+
+  // ── Camera sharing state ──────────────────────────────────────────────────
+  const [isCameraSharing, setIsCameraSharing] = useState(false);
+
+  const {
+    localStream,
+    remoteStream,
+    status: camSharingStatus,
+    errorMsg: camSharingError,
+    audioEnabled: camAudioEnabled,
+    toggleAudio: camToggleAudio,
+    stop: stopCameraSharing,
+  } = useWebRTCCamera({ nickname, isEnabled: isCameraSharing });
+
+  const handleCameraShareClose = () => {
+    stopCameraSharing();
+    setIsCameraSharing(false);
+  };
+
+  // ── Voice call state ──────────────────────────────────────────────────────
+  const {
+    callStatus,
+    isMicOn,
+    isSpeakerOn,
+    isNearEar,
+    callerName,
+    callDuration,
+    startCall,
+    acceptCall,
+    rejectCall,
+    endCall,
+    toggleMic,
+    toggleSpeaker,
+  } = useVoiceCall(nickname);
+
+  // Is a call screen visible? (calling, incoming, connected, ended, busy)
+  // callStatus "calling" = small 52px bar only at top, chat still visible
+
+  // Book icon menu handlers
+  const handleStartCamera = () => {
+    setIsCameraSharing(prev => {
+      if (prev) { stopCameraSharing(); return false; }
+      return true;
+    });
+  };
+
+  const handleStartCall = () => {
+    // Check if other user is online before calling
+    if (isOtherUserOnline === false) {
+      alert(`${nickname === 'Vishwa' ? 'Ammu' : 'Vishwa'} is offline. Try again when they're online.`);
+      return;
+    }
+    startCall();
+  };
+  // ────────────────────────────────────────────────────────────────────────────
 
   // Memory state
   const [memoryState, setMemoryState] = useState<"closed" | "password" | "open">("closed");
@@ -226,8 +278,12 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
         console.log('🚪 Exiting Chat2, turning off camera...');
         setCameraOff();
       }
+      // Also stop camera sharing on unmount
+      if (isCameraSharing) {
+        stopCameraSharing();
+      }
     };
-  }, [isCameraOn, setCameraOff]);
+  }, [isCameraOn, setCameraOff, isCameraSharing, stopCameraSharing]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -313,60 +369,76 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
     return () => clearTimeout(t);
   }, [selfTyping]);
 
-  let messageQueue: string[] = [];
-  let isProcessing = false;
+  // ===============================================
+// 🔥 FRONTEND NOTIFICATION ENGINE — FIXED
+// ===============================================
+// Paste this inside your Chat2 component, replacing the existing
+// sendMessageNotification + processQueue + messageQueue code.
+//
+// Changes from your current version:
+//  1. messageQueue and isProcessing moved to useRef → survive re-renders
+//     (your current version resets them to [] and false on every render)
+//  2. Removed the "wait loop" for isOtherUserOnline — it can block forever
+//     if status never loads; replaced with a one-time check
+//  3. If Vishwa is online → skip notification immediately (no queue needed)
+//  4. Retry on network error with max 3 retries per message (not infinite)
+//  5. 1.2s delay between sends kept (prevents spam)
+// ===============================================
 
-  const sendMessageNotification = async (messageText: string) => {
-    if (nickname !== "Ammu") return;
+// ── Put these TWO lines at the TOP of your Chat2 component (with other useRefs)
+const messageQueueRef = useRef<string[]>([]);
+const isProcessingRef = useRef(false);
 
-    const safeMessage = (messageText ?? "").trim();
+// ── Replace your sendMessageNotification function with this ──────────────────
+const sendMessageNotification = async (messageText: string) => {
+  // Only Ammu sends notifications to Vishwa
+  if (nickname !== "Ammu") return;
 
-    if (!safeMessage) {
-      console.log("⚠️ Empty message — recovering…");
+  const safeMessage = (messageText ?? "").trim();
+  if (!safeMessage) {
+    console.log("⚠️ Empty notification text — skipped");
+    return;
+  }
 
-      if (msgs.length > 0) {
-        const last = msgs[msgs.length - 1].text;
-        if (last?.trim()) {
-          messageQueue.push(last.trim());
-          if (!isProcessing) processQueue();
-          return;
-        }
-      }
+  // If Vishwa is confirmed online right now → skip entirely, no need to notify
+  if (isOtherUserOnline === true) {
+    console.log("🟢 Vishwa is online — notification skipped");
+    return;
+  }
 
-      console.log("🚫 No recovery possible — skip");
-      return;
+  // Queue the message and start processing
+  messageQueueRef.current.push(safeMessage);
+  console.log("📦 Queued:", safeMessage, "| Queue size:", messageQueueRef.current.length);
+
+  if (!isProcessingRef.current) {
+    processNotificationQueue();
+  }
+};
+
+// ── Replace your processQueue function with this ─────────────────────────────
+const processNotificationQueue = async () => {
+  if (isProcessingRef.current) return;
+  isProcessingRef.current = true;
+
+  while (messageQueueRef.current.length > 0) {
+    const nextMessage = messageQueueRef.current[0]?.trim();
+
+    // Skip empty entries
+    if (!nextMessage) {
+      messageQueueRef.current.shift();
+      continue;
     }
 
-    if (isOtherUserOnline === undefined || isOtherUserOnline === null) {
-      console.log("⏳ Status unknown — queued:", safeMessage);
-      messageQueue.push(safeMessage);
-      if (!isProcessing) processQueue();
-      return;
+    // If Vishwa came online while we were processing → clear queue, stop
+    if (isOtherUserOnline === true) {
+      console.log("🟢 Vishwa came online — clearing notification queue");
+      messageQueueRef.current = [];
+      break;
     }
 
-    if (isOtherUserOnline) {
-      console.log("🟢 Vishwa online — skip");
-      return;
-    }
-
-    messageQueue.push(safeMessage);
-    if (!isProcessing) processQueue();
-  };
-
-  const processQueue = async () => {
-    if (isProcessing) return;
-    isProcessing = true;
-
-    while (messageQueue.length > 0) {
-      let nextMessage = messageQueue.shift();
-
-      if (!nextMessage || !nextMessage.trim()) {
-        console.log("⚠️ Skipped empty");
-        continue;
-      }
-
-      nextMessage = nextMessage.trim();
-
+    // Attempt to send with up to 3 retries
+    let sent = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         const res = await fetch(`${BACKEND_URL}/send`, {
           method: "POST",
@@ -374,35 +446,42 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
           body: JSON.stringify({ message: nextMessage }),
         });
 
-        let data = null;
+        // Accept both success:true and queued:true as "delivered to backend"
+        let data: any = { success: false };
+        try { data = await res.json(); } catch {}
 
-        try {
-          data = await res.json();
-        } catch {
-          data = { queued: true }; 
-        }
-
-        if (data.success) {
-          console.log("📨 SENT:", nextMessage);
-        } 
-        else if (data.queued) {
-          console.log("🔁 Backend queued:", nextMessage);
-        } 
-        else {
-          console.warn("⚠️ Unexpected:", data);
-          messageQueue.unshift(nextMessage);
+        if (data.success || data.queued) {
+          console.log(`📨 Sent to backend (attempt ${attempt}):`, nextMessage);
+          sent = true;
+          break;
+        } else {
+          console.warn(`⚠️ Backend returned unexpected response:`, data);
+          sent = true; // treat as sent to avoid infinite retry
+          break;
         }
       } catch (err) {
-        console.error("⚠️ Network issue — retrying…", err);
-        await new Promise((r) => setTimeout(r, 1000));
-        messageQueue.unshift(nextMessage);
+        console.log(`⚠️ Network error (attempt ${attempt}/3):`, err);
+        if (attempt < 3) {
+          await new Promise(r => setTimeout(r, 2000 * attempt)); // 2s, 4s
+        }
       }
-
-      await new Promise((r) => setTimeout(r, 1100));
     }
 
-    isProcessing = false;
-  };
+    // Remove from queue whether sent or not (backend has its own retry queue)
+    messageQueueRef.current.shift();
+
+    if (!sent) {
+      console.log("❌ Failed after 3 attempts — backend will retry:", nextMessage);
+    }
+
+    // Small gap between messages
+    if (messageQueueRef.current.length > 0) {
+      await new Promise(r => setTimeout(r, 1200));
+    }
+  }
+
+  isProcessingRef.current = false;
+};
 
   const handleReply = (messageId: string, text: string) => {
     const message = msgs.find(msg => msg.id === messageId);
@@ -522,17 +601,6 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
     }
   }, [msgs, nickname]);
 
-  // 🔥 MEMORY-OPTIMIZED: Old image upload handler removed
-  // The new InstagramPlusButton now handles image processing and passes
-  // both the file AND the preview URL directly to onImageSelect
-
-  /**
-   * 🔥 MEMORY-OPTIMIZED IMAGE HANDLER
-   * 
-   * This handler receives the already-processed image and preview URL
-   * from InstagramPlusButton. The preview URL is already a blob URL
-   * (not base64), which is much more memory efficient.
-   */
   const handleImageSelect = useCallback((file: File, previewUrl: string) => {
     // Clean up any existing preview URL
     if (imagePreviewUrlRef.current && imagePreviewUrlRef.current !== previewUrl) {
@@ -593,9 +661,6 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
     setImagePreview(null);
   };
 
-  /**
-   * 🔥 MEMORY-OPTIMIZED VIDEO HANDLER
-   */
   const handleVideoSelect = useCallback((file: File, previewUrl: string) => {
     // Clean up any existing preview URL
     if (videoPreviewUrlRef.current && videoPreviewUrlRef.current !== previewUrl) {
@@ -646,9 +711,6 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
     setVideoPreview(null);
   };
 
-  /**
-   * 🔥 MEMORY-OPTIMIZED FILE HANDLER
-   */
   const handleFileSelect = useCallback((file: File, previewUrl: string) => {
     setSelectedFile(file);
     setFilePreview(previewUrl || file.name); // Use filename if no preview
@@ -798,6 +860,161 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
       <KissEmojiRain show={showKissRain} onComplete={() => setShowKissRain(false)} />
       <MoodReactor isActive={isReactorActive} onComplete={handleReactorComplete} />
 
+      {/* ── INLINE VOICE CALL UI ── */}
+
+      {/* CALLER: small 52px green bar at top — chat still fully visible */}
+      {callStatus === "calling" && (
+        <div style={{
+          position:"fixed", top:0, left:0, right:0, height:52,
+          zIndex:9999, background:"linear-gradient(90deg,#10b981,#059669)",
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          padding:"0 16px", boxShadow:"0 2px 12px rgba(16,185,129,0.4)",
+        }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+            <span style={{ color:"#fff", fontWeight:700, fontSize:14 }}>
+              📞 Calling {nickname === "Vishwa" ? "Ammu" : "Vishwa"}…
+            </span>
+          </div>
+          <button onClick={endCall} style={{
+            background:"rgba(255,255,255,0.25)", border:"none",
+            borderRadius:20, padding:"6px 16px",
+            color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer",
+          }}>Cancel</button>
+        </div>
+      )}
+
+      {/* PROXIMITY SENSOR: pure black screen when phone near ear */}
+      {isNearEar && (callStatus === "connected" || callStatus === "connecting") && (
+        <div style={{ position:"fixed", inset:0, zIndex:9999, background:"#000" }}/>
+      )}
+
+      {/* INCOMING CALL: full white screen with accept/reject */}
+      {callStatus === "incoming" && !isNearEar && (
+        <div style={{ position:"fixed", inset:0, zIndex:9999, background:"#fff", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"space-between", fontFamily:"system-ui" }}>
+          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16 }}>
+            <div style={{ width:96, height:96, borderRadius:"50%", background:"linear-gradient(135deg,#10b981,#059669)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:38, fontWeight:800, color:"#fff", boxShadow:"0 8px 32px rgba(16,185,129,0.3)" }}>
+              {(callerName ?? (nickname === "Vishwa" ? "Ammu" : "Vishwa")).charAt(0).toUpperCase()}
+            </div>
+            <h2 style={{ fontSize:26, fontWeight:700, color:"#111827", margin:0 }}>{callerName ?? (nickname === "Vishwa" ? "Ammu" : "Vishwa")}</h2>
+            <p style={{ fontSize:15, color:"#6b7280", margin:0 }}>Incoming voice call…</p>
+          </div>
+          <div style={{ display:"flex", gap:60, paddingBottom:56 }}>
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}>
+              <button onClick={rejectCall} style={{ width:72, height:72, borderRadius:"50%", border:"none", background:"#ef4444", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", boxShadow:"0 4px 16px rgba(239,68,68,0.4)" }}>
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.42 19.42 0 0 1 4.43 13a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.34 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.32 9.9"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              </button>
+              <span style={{ fontSize:11, color:"#9ca3af", fontWeight:500 }}>Decline</span>
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}>
+              <button onClick={acceptCall} style={{ width:72, height:72, borderRadius:"50%", border:"none", background:"#22c55e", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", boxShadow:"0 4px 16px rgba(34,197,94,0.4)" }}>
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 15.1 19.79 19.79 0 0 1 1.62 6.53A2 2 0 0 1 3.59 4.34h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L7.91 12.1a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 18.92z"/></svg>
+              </button>
+              <span style={{ fontSize:11, color:"#9ca3af", fontWeight:500 }}>Accept</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CONNECTING: full white screen with spinner */}
+      {callStatus === "connecting" && !isNearEar && (
+        <div style={{ position:"fixed", inset:0, zIndex:9999, background:"#fff", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"space-between", fontFamily:"system-ui" }}>
+          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:14 }}>
+            <div style={{ width:88, height:88, borderRadius:"50%", background:"linear-gradient(135deg,#10b981,#059669)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:32, fontWeight:800, color:"#fff" }}>
+              {(callerName ?? (nickname === "Vishwa" ? "Ammu" : "Vishwa")).charAt(0).toUpperCase()}
+            </div>
+            <h2 style={{ fontSize:26, fontWeight:700, color:"#111827", margin:0 }}>{callerName ?? (nickname === "Vishwa" ? "Ammu" : "Vishwa")}</h2>
+            <p style={{ fontSize:15, color:"#6b7280", margin:0 }}>Connecting…</p>
+          </div>
+          <div style={{ paddingBottom:56 }}>
+            <button onClick={endCall} style={{ width:64, height:64, borderRadius:"50%", border:"none", background:"#ef4444", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", boxShadow:"0 4px 16px rgba(239,68,68,0.3)" }}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.42 19.42 0 0 1 4.43 13a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.34 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.32 9.9"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* CONNECTED: full white screen with controls */}
+      {callStatus === "connected" && !isNearEar && (
+        <div style={{ position:"fixed", inset:0, zIndex:9999, background:"#fff", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"space-between", fontFamily:"system-ui" }}>
+          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:12 }}>
+            <div style={{ width:88, height:88, borderRadius:"50%", background:"linear-gradient(135deg,#10b981,#059669)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:32, fontWeight:800, color:"#fff", boxShadow:"0 4px 24px rgba(16,185,129,0.3)" }}>
+              {(callerName ?? (nickname === "Vishwa" ? "Ammu" : "Vishwa")).charAt(0).toUpperCase()}
+            </div>
+            <h2 style={{ fontSize:26, fontWeight:700, color:"#111827", margin:0 }}>{callerName ?? (nickname === "Vishwa" ? "Ammu" : "Vishwa")}</h2>
+            <span style={{ fontSize:20, color:"#6b7280", fontWeight:500, letterSpacing:3 }}>
+              {String(Math.floor(callDuration/60)).padStart(2,"0")}:{String(callDuration%60).padStart(2,"0")}
+            </span>
+            <span style={{ fontSize:12, color: isSpeakerOn?"#10b981":"#9ca3af", fontWeight:500 }}>
+              {isSpeakerOn ? "🔊 Loudspeaker" : "🔇 Earpiece"}
+            </span>
+          </div>
+          <div style={{ display:"flex", gap:28, paddingBottom:60, alignItems:"center" }}>
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}>
+              <button onClick={toggleMic} style={{ width:58, height:58, borderRadius:"50%", border:"none", background:isMicOn?"#f3f4f6":"#1f2937", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", boxShadow:"0 4px 14px rgba(0,0,0,0.1)" }}>
+                {isMicOn
+                  ? <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#374151" strokeWidth="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                  : <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                }
+              </button>
+              <span style={{ fontSize:11, color:"#9ca3af", fontWeight:500 }}>{isMicOn?"Mute":"Unmute"}</span>
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}>
+              <button onClick={endCall} style={{ width:72, height:72, borderRadius:"50%", border:"none", background:"#ef4444", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", boxShadow:"0 4px 20px rgba(239,68,68,0.4)" }}>
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.42 19.42 0 0 1 4.43 13a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.34 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.32 9.9"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              </button>
+              <span style={{ fontSize:11, color:"#9ca3af", fontWeight:500 }}>End</span>
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}>
+              <button onClick={toggleSpeaker} style={{ width:58, height:58, borderRadius:"50%", border:"none", background:isSpeakerOn?"#10b981":"#f3f4f6", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", boxShadow:"0 4px 14px rgba(0,0,0,0.1)" }}>
+                {isSpeakerOn
+                  ? <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+                  : <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#374151" strokeWidth="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+                }
+              </button>
+              <span style={{ fontSize:11, color:"#9ca3af", fontWeight:500 }}>{isSpeakerOn?"Speaker":"Earpiece"}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BUSY: small toast at top — user offline, no white screen */}
+      {callStatus === "busy" && (
+        <div style={{
+          position:"fixed", top:0, left:0, right:0, height:52,
+          zIndex:9999, background:"linear-gradient(90deg,#ef4444,#dc2626)",
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          padding:"0 16px", boxShadow:"0 2px 12px rgba(239,68,68,0.4)",
+        }}>
+          <span style={{ color:"#fff", fontWeight:700, fontSize:14 }}>
+            📵 {callerName ?? (nickname === "Vishwa" ? "Ammu" : "Vishwa")} is offline
+          </span>
+          <button onClick={endCall} style={{
+            background:"rgba(255,255,255,0.25)", border:"none",
+            borderRadius:20, padding:"6px 14px",
+            color:"#fff", fontSize:12, fontWeight:700, cursor:"pointer",
+          }}>OK</button>
+        </div>
+      )}
+
+      {/* ENDED: small toast at top — call ended, no white screen */}
+      {callStatus === "ended" && (
+        <div style={{
+          position:"fixed", top:0, left:0, right:0, height:52,
+          zIndex:9999, background:"linear-gradient(90deg,#6b7280,#4b5563)",
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          padding:"0 16px", boxShadow:"0 2px 12px rgba(0,0,0,0.2)",
+        }}>
+          <span style={{ color:"#fff", fontWeight:700, fontSize:14 }}>
+            📴 Call ended {callDuration > 0 ? `· ${String(Math.floor(callDuration/60)).padStart(2,"0")}:${String(callDuration%60).padStart(2,"0")}` : ""}
+          </span>
+          <button onClick={endCall} style={{
+            background:"rgba(255,255,255,0.25)", border:"none",
+            borderRadius:20, padding:"6px 14px",
+            color:"#fff", fontSize:12, fontWeight:700, cursor:"pointer",
+          }}>OK</button>
+        </div>
+      )}
+
       {isCameraOn && (
         <CameraButton
           isCameraOn={isCameraOn}
@@ -806,6 +1023,19 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
           faceCount={faceCount}
         />
       )}
+
+      {/* ── NEW: Camera sharing overlay (WebRTC floating window) ── */}
+      <CameraShareOverlay
+        localStream={localStream}
+        remoteStream={remoteStream}
+        status={camSharingStatus}
+        errorMsg={camSharingError}
+        nickname={nickname}
+        isEnabled={isCameraSharing}
+        audioEnabled={camAudioEnabled}
+        onToggleAudio={camToggleAudio}
+        onClose={handleCameraShareClose}
+      />
 
 <style jsx>{`
   @keyframes swing {
@@ -841,7 +1071,14 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
         <div className="max-w-4xl mx-auto">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 flex-shrink-0 min-w-0">
-              <BookOpen className="w-5 h-5 sm:w-6 sm:h-6 text-green-600 flex-shrink-0" />
+              {/* ── Book icon → popup menu with Camera + Voice Call options ── */}
+              <BookIconMenu
+                isCameraSharing={isCameraSharing}
+                isInCall={callStatus !== "idle"}
+                onStartCamera={handleStartCamera}
+                onStartCall={handleStartCall}
+              />
+
               <div className="min-w-0">
                 <h1 className="text-sm sm:text-lg font-bold bg-gradient-to-r from-green-600 to-emerald-600 bg-clip-text text-transparent truncate">
                   AI Teacher
@@ -926,10 +1163,9 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
         </div>
       </div>
 
-      {/* Mobile Moods - Fixed: Separate Moods text from MoodDisplay */}
+      {/* Mobile Moods */}
       <div className="sm:hidden fixed top-14 left-0 right-0 z-40 flex justify-center px-2 pt-2">
         <div className="flex flex-col items-center gap-1 bg-transparent rounded-b-3xl px-6 py-3">
-          {/* Only this text navigates to Chat3 */}
           <button
             onClick={onSwitchToChat3}
             className="text-xs font-medium text-blue-600 hover:text-blue-800 transition-colors cursor-pointer"
@@ -937,7 +1173,6 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
             Moods
           </button>
           
-          {/* MoodDisplay - clicking emoji opens picker */}
           <MoodDisplay
             userMood={userMood}
             otherUserMood={otherUserMood}
@@ -1124,7 +1359,6 @@ function Chat2({ nickname, onLogout, onSwitchToAIChat, onSwitchToChat3, onOpenCo
 
         <form onSubmit={handleSendMessage} className="max-w-4xl mx-auto">
           <div className="flex gap-3 items-end">
-            {/* 🔥 MEMORY-OPTIMIZED: Updated callback signature */}
             <InstagramPlusButton
               onImageSelect={handleImageSelect}
               onVideoSelect={handleVideoSelect}

@@ -11,15 +11,22 @@ export function useFaceDetection({ isEnabled, onViolation, onToggle }: UseFaceDe
   const [isLoading, setIsLoading] = useState(false);
   const [faceCount, setFaceCount] = useState(0);
 
-  const videoRef            = useRef<HTMLVideoElement | null>(null);
-  const streamRef           = useRef<MediaStream | null>(null);
+  const videoRef             = useRef<HTMLVideoElement | null>(null);
+  const streamRef            = useRef<MediaStream | null>(null);
   const detectionIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const modelsLoadedRef     = useRef(false);
-  const violationCountRef   = useRef(0);
-  const isProcessingRef     = useRef(false);
-  const isMountedRef        = useRef(true);
+  const modelsLoadedRef      = useRef(false);
+  const violationCountRef    = useRef(0);
+  const isProcessingRef      = useRef(false);
+  const isMountedRef         = useRef(true);
 
-  // ── Load models once ──────────────────────────────────────────────────────
+  // ── How many consecutive bad frames before redirect ───────────────────────
+  // At 500ms interval × 8 frames = 4 seconds before redirect
+  // This handles: dark rooms, movement, walking, running, phone shake
+  // Only triggers if face is TRULY gone for 4 straight seconds
+  const VIOLATION_THRESHOLD = 8;
+  const DETECTION_INTERVAL  = 500; // ms between checks
+
+  // ── Load models ───────────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
     if (modelsLoadedRef.current) return;
     try {
@@ -38,19 +45,17 @@ export function useFaceDetection({ isEnabled, onViolation, onToggle }: UseFaceDe
 
   // ── Detection loop ────────────────────────────────────────────────────────
   const startDetection = useCallback(() => {
-    // Clear any existing interval first
     if (detectionIntervalRef.current) {
       clearInterval(detectionIntervalRef.current);
       detectionIntervalRef.current = null;
     }
 
     detectionIntervalRef.current = setInterval(async () => {
-      // Skip if video not ready or already processing
       if (
         !videoRef.current ||
         !modelsLoadedRef.current ||
         isProcessingRef.current ||
-        videoRef.current.readyState < 2 // HAVE_CURRENT_DATA
+        videoRef.current.readyState < 2
       ) return;
 
       try {
@@ -59,8 +64,8 @@ export function useFaceDetection({ isEnabled, onViolation, onToggle }: UseFaceDe
         const detections = await faceapi.detectAllFaces(
           videoRef.current,
           new faceapi.TinyFaceDetectorOptions({
-            inputSize:      160,  // smaller = faster (was 192)
-            scoreThreshold: 0.45  // slightly lower = catches faces faster
+            inputSize:      224,   // larger = better detection in low light
+            scoreThreshold: 0.2    // very low = catches faces in dark, blur, movement
           })
         );
 
@@ -70,45 +75,45 @@ export function useFaceDetection({ isEnabled, onViolation, onToggle }: UseFaceDe
         setFaceCount(count);
 
         if (count === 0 || count >= 2) {
-          // Bad frame — increment violation counter
           violationCountRef.current += 1;
-          console.log(`🚨 Violation ${violationCountRef.current}/2 — faces: ${count}`);
+          console.log(`🚨 Violation ${violationCountRef.current}/${VIOLATION_THRESHOLD} — faces: ${count}`);
 
-          // 2 consecutive bad frames at 300ms = ~600ms to redirect
-          if (violationCountRef.current >= 2) {
-            console.log('🚨 CONFIRMED — redirecting to Chat1 NOW');
+          if (violationCountRef.current >= VIOLATION_THRESHOLD) {
+            console.log('🚨 CONFIRMED violation — redirecting');
             violationCountRef.current = 0;
             stopCamera();
             onViolation();
           }
         } else {
-          // Exactly 1 face — all good, reset counter
+          // Exactly 1 face — valid, reset counter completely
+          if (violationCountRef.current > 0) {
+            console.log('✅ Face back — reset violation counter');
+          }
           violationCountRef.current = 0;
         }
 
-      } catch (error) {
-        // Silent — skip bad frames without counting as violations
+      } catch {
+        // Skip bad frames silently — never count errors as violations
       } finally {
         isProcessingRef.current = false;
       }
 
-    }, 300); // ← KEY CHANGE: was 1000ms, now 300ms = 3x faster detection
+    }, DETECTION_INTERVAL);
 
   }, [onViolation]);
 
-  // ── Start camera + detection ───────────────────────────────────────────────
+  // ── Start camera ──────────────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
     try {
       setIsLoading(true);
-
       await loadModels();
       if (!isMountedRef.current) return;
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: 'user',
-          width:  { ideal: 320 }, // smaller = faster detection
-          height: { ideal: 240 },
+          width:  { ideal: 640 },
+          height: { ideal: 480 },
           frameRate: { ideal: 15 },
         }
       });
@@ -120,7 +125,6 @@ export function useFaceDetection({ isEnabled, onViolation, onToggle }: UseFaceDe
 
       streamRef.current = stream;
 
-      // Create hidden video element
       if (!videoRef.current) {
         const video = document.createElement('video');
         video.autoplay    = true;
@@ -140,7 +144,7 @@ export function useFaceDetection({ isEnabled, onViolation, onToggle }: UseFaceDe
       }
 
       startDetection();
-      console.log('📹 Face detection active (300ms interval)');
+      console.log(`📹 Face detection active (${DETECTION_INTERVAL}ms, threshold ${VIOLATION_THRESHOLD})`);
 
     } catch (error) {
       console.error('❌ Camera start error:', error);
@@ -153,7 +157,7 @@ export function useFaceDetection({ isEnabled, onViolation, onToggle }: UseFaceDe
     }
   }, [loadModels, startDetection, onToggle]);
 
-  // ── Stop camera + detection ───────────────────────────────────────────────
+  // ── Stop camera ───────────────────────────────────────────────────────────
   const stopCamera = useCallback(() => {
     if (detectionIntervalRef.current) {
       clearInterval(detectionIntervalRef.current);

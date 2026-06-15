@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef, useCallback } from "react";
-import { Flame, Download, X, Play, Pause, ChevronLeft, ChevronRight } from "lucide-react";
+import { Flame, Download, X, Play, Pause, ChevronLeft, ChevronRight, MessageCircle } from "lucide-react";
 import { useIsMobile } from "../../hooks/use-mobile";
 import { useCoupleMemory } from "../../hooks/useCoupleMemory";
+import ChatHistoryPage from "./ChatHistoryPage";
 
 interface Props {
   nickname?: "Vishwa" | "Ammu";
@@ -27,6 +28,7 @@ export default function CoupleMemoryPage({
   const [index, setIndex] = useState(0);
   const [fullscreenImage, setFullscreenImage] = useState<StorageImage | null>(null);
   const [isPaused, setIsPaused] = useState(false);
+  const [showChatHistory, setShowChatHistory] = useState(false);
   const scrollPositionRef = useRef(0);
   const containerRef = useRef<HTMLDivElement>(null);
   const isMobile = useIsMobile();
@@ -191,8 +193,21 @@ export default function CoupleMemoryPage({
     >
       {/* HEADER */}
       <div className="flex justify-between items-center px-4 py-3 bg-white/30 backdrop-blur-md">
-        <div className="text-lg font-semibold text-white drop-shadow">
-          ❤️ Our Memories ✨
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => {
+              // Set skip flag BEFORE setState so there's no race window with useAmmeSafetyLogout
+              (window as any).__AMMU_SKIP_LOGOUT__?.start();
+              setShowChatHistory(true);
+            }}
+            className="p-2 rounded-full bg-white/50 hover:bg-white/80 text-gray-700 shadow transition-colors"
+            title="Chat History"
+          >
+            <MessageCircle className="w-5 h-5" />
+          </button>
+          <div className="text-lg font-semibold text-white drop-shadow">
+            Our Memories
+          </div>
         </div>
         <div className="flex gap-2">
           {onNavigateToChat1 && (
@@ -473,6 +488,18 @@ export default function CoupleMemoryPage({
             </button>
           </div>
         </div>
+      )}
+
+      {/* Chat History Page */}
+      {showChatHistory && nickname && (
+        <ChatHistoryPage
+          nickname={nickname}
+          onExit={() => {
+            setShowChatHistory(false);
+            // Resume safety logout now that history is closed
+            (window as any).__AMMU_SKIP_LOGOUT__?.stop();
+          }}
+        />
       )}
     </div>
   );

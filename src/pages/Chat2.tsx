@@ -1532,7 +1532,7 @@ const processNotificationQueue = async () => {
       )}
 
       {memoryState === "open" && (
-        <CoupleMemoryPage onExit={() => setMemoryState("closed")} />
+        <CoupleMemoryPage nickname={nickname} onExit={() => setMemoryState("closed")} />
       )}
 
       <div className={`fixed inset-0 pointer-events-none overflow-hidden transition-opacity duration-500 ${showKissRain || isReactorActive ? 'opacity-0' : 'opacity-100'}`}>
